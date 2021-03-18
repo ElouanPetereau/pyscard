@@ -29,18 +29,15 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 """
 
 from __future__ import print_function
+
+import traceback
 from threading import Thread, Event
 from time import sleep
-import traceback
-
-from smartcard.Observer import Observer
-from smartcard.Observer import Observable
 
 from smartcard.CardRequest import CardRequest
-from smartcard.Exceptions import SmartcardException
-from smartcard.scard import SCARD_E_NO_SERVICE
-
-_START_ON_DEMAND_ = False
+from smartcard.Observer import Observable
+from smartcard.Observer import Observer
+from smartcard.Synchronization import *
 
 
 # CardObserver interface
@@ -64,7 +61,7 @@ class CardObserver(Observer):
         pass
 
 
-class CardMonitor(object):
+class CardMonitor(Observable):
     """Class that monitors smart card insertion / removals.
     and notify observers
 
@@ -73,94 +70,98 @@ class CardMonitor(object):
     is called. Do not forget to delete all your observers by
     calling deleteObserver, or your program will run forever...
 
-    Uses the singleton pattern from Thinking in Python
-    Bruce Eckel, http://mindview.net/Books/TIPython to make sure
-    there is only one CardMonitor.
+    It implements the shared state design pattern, where objects
+    of the same type all share the same state, in our case essentially
+    the CardMonitoring Thread.
     """
 
-    class __CardMonitorSingleton(Observable):
-        """The real smart card monitor class.
+    __shared_state = {}
 
-        A single instance of this class is created
-        by the public CardMonitor class.
-        """
+    def __init__(self, startOnDemand=True, period=1, timeout=0.1):
+        self.__dict__ = self.__shared_state
+        Observable.__init__(self)
+        self.startOnDemand = startOnDemand
+        self.period = period
+        if self.startOnDemand:
+            self.rmthread = None
+        else:
+            self.rmthread = CardMonitoringThread(self, self.period, self.timeout)
+            self.rmthread.start()
+        self.timeout = timeout
 
-        def __init__(self):
-            Observable.__init__(self)
-            if _START_ON_DEMAND_:
+    def addObserver(self, observer):
+        """Add an observer."""
+        Observable.addObserver(self, observer)
+
+        # If self.startOnDemand is True, the card monitoring
+        # thread only runs when there are observers.
+        if self.startOnDemand:
+            if 0 < self.countObservers():
+                if not self.rmthread:
+                    self.rmthread = CardMonitoringThread(self, self.period, self.timeout)
+
+                    # start card monitoring thread in another thread to
+                    # avoid a deadlock; addObserver and notifyObservers called
+                    # in the CardMonitoringThread run() method are
+                    # synchronized
+                    try:
+                        # Python 3.x
+                        import _thread
+                        _thread.start_new_thread(self.rmthread.start, ())
+                    except:
+                        # Python 2.x
+                        import thread
+                        thread.start_new_thread(self.rmthread.start, ())
+        else:
+            observer.update(self, (self.rmthread.cards, []))
+
+    def deleteObserver(self, observer):
+        """Remove an observer."""
+        Observable.deleteObserver(self, observer)
+        # If self.startOnDemand is True, the card monitoring
+        # thread is stopped when there are no more observers.
+        if self.startOnDemand:
+            if 0 == self.countObservers():
+                self.rmthread.stop()
+                del self.rmthread
                 self.rmthread = None
-            else:
-                self.rmthread = CardMonitoringThread(self)
-
-        def addObserver(self, observer):
-            """Add an observer.
-
-            We only start the card monitoring thread when
-            there are observers.
-            """
-            Observable.addObserver(self, observer)
-            if _START_ON_DEMAND_:
-                if self.countObservers() > 0 and self.rmthread is None:
-                    self.rmthread = CardMonitoringThread(self)
-            else:
-                observer.update(self, (self.rmthread.cards, []))
-
-        def deleteObserver(self, observer):
-            """Remove an observer.
-
-            We delete the CardMonitoringThread reference when there
-            are no more observers.
-            """
-            Observable.deleteObserver(self, observer)
-            if _START_ON_DEMAND_:
-                if self.countObservers() == 0:
-                    if self.rmthread is not None:
-                        self.rmthread.stop()
-                        self.rmthread.join()
-                        self.rmthread = None
-
-        def __str__(self):
-            return 'CardMonitor'
-
-    # the singleton
-    instance = None
-
-    def __init__(self):
-        if not CardMonitor.instance:
-            CardMonitor.instance = CardMonitor.__CardMonitorSingleton()
-
-    def __getattr__(self, name):
-        return getattr(self.instance, name)
 
 
-class CardMonitoringThread(object):
+synchronize(CardMonitor,
+            "addObserver deleteObserver deleteObservers " +
+            "setChanged clearChanged hasChanged " +
+            "countObservers")
+
+
+class CardMonitoringThread(Thread):
     """Card insertion thread.
     This thread waits for card insertion.
     """
 
-    class __CardMonitoringThreadSingleton(Thread):
-        """The real card monitoring thread class.
+    __shared_state = {}
 
-        A single instance of this class is created
-        by the public CardMonitoringThread class.
+    def __init__(self, observable, period, timeout):
+        self.__dict__ = self.__shared_state
+        Thread.__init__(self)
+        self.observable = observable
+        self.stopEvent = Event()
+        self.stopEvent.clear()
+        self.cards = []
+        self.setDaemon(True)
+        self.setName('smartcard.CardMonitoringThread')
+        self.period = period
+        self.timeout = timeout
+        self.cardrequest = None
+
+    def run(self):
+        """Runs until stopEvent is notified, and notify
+        observers of all card insertion/removal.
         """
-
-        def __init__(self, observable):
-            Thread.__init__(self)
-            self.observable = observable
-            self.stopEvent = Event()
-            self.stopEvent.clear()
-            self.cards = []
-            self.setDaemon(True)
-
-        # the actual monitoring thread
-        def run(self):
-            """Runs until stopEvent is notified, and notify
-            observers of all card insertion/removal.
-            """
-            self.cardrequest = CardRequest(timeout=0.1)
-            while self.stopEvent.isSet() != 1:
-                try:
+        self.cardrequest = CardRequest(self.timeout)
+        while not self.stopEvent.isSet():
+            try:
+                # no need to monitor if no observers
+                if 0 < self.observable.countObservers():
                     currentcards = self.cardrequest.waitforcardevent()
 
                     addedcards = []
@@ -179,55 +180,31 @@ class CardMonitoringThread(object):
                         self.observable.notifyObservers(
                             (addedcards, removedcards))
 
-                # when CardMonitoringThread.__del__() is invoked in
-                # response to shutdown, e.g., when execution of the
-                # program is done, other globals referenced by the
-                # __del__() method may already have been deleted.
-                # this causes ReaderMonitoringThread.run() to except
-                # with a TypeError or AttributeError
-                except TypeError:
-                    pass
-                except AttributeError:
-                    pass
+                # wait every second on stopEvent
+                self.stopEvent.wait(self.period)
 
-                except SmartcardException as exc:
-                    # FIXME Tighten the exceptions caught by this block
-                    traceback.print_exc()
-                    # Most likely raised during interpreter shutdown due
-                    # to unclean exit which failed to remove all observers.
-                    # To solve this, we set the stop event and pass the
-                    # exception to let the thread finish gracefully.
-                    if exc.hresult == SCARD_E_NO_SERVICE:
-                        self.stopEvent.set()
+            # when CardMonitoringThread.__del__() is invoked in
+            # response to shutdown, e.g., when execution of the
+            # program is done, other globals referenced by the
+            # __del__() method may already have been deleted.
+            # this causes ReaderMonitoringThread.run() to except
+            # with a TypeError or AttributeError
+            except TypeError:
+                pass
+            except AttributeError:
+                pass
+            except Exception:
+                # FIXME Tighten the exceptions caught by this block
+                traceback.print_exc()
+                # Most likely raised during interpreter shutdown due
+                # to unclean exit which failed to remove all observers.
+                # To solve this, we set the stop event and pass the
+                # exception to let the thread finish gracefully.
+                self.stopEvent.set()
 
-        # stop the thread by signaling stopEvent
-        def stop(self):
-            self.stopEvent.set()
-
-    # the singleton
-    instance = None
-
-    def __init__(self, observable):
-        if not CardMonitoringThread.instance:
-            CardMonitoringThread.instance = \
-               CardMonitoringThread.__CardMonitoringThreadSingleton(observable)
-            CardMonitoringThread.instance.start()
-
-    def join(self, *args, **kwargs):
-        if self.instance:
-            self.instance.join(*args, **kwargs)
-            CardMonitoringThread.instance = None
-
-    def __getattr__(self, name):
-        if self.instance:
-            return getattr(self.instance, name)
-
-    # commented to avoid bad clean-up sequence of python where __del__
-    # is called when some objects it uses are already gargabe collected
-    # def __del__(self):
-    #    if CardMonitoringThread.instance!=None:
-    #        CardMonitoringThread.instance.stop()
-    #        CardMonitoringThread.instance = None
+    def stop(self):
+        self.stopEvent.set()
+        self.join()
 
 
 if __name__ == "__main__":
