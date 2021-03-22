@@ -77,7 +77,7 @@ class CardMonitor(Observable):
 
     __shared_state = {}
 
-    def __init__(self, startOnDemand=True, period=1, timeout=0.1):
+    def __init__(self, startOnDemand=True, period=1):
         self.__dict__ = self.__shared_state
         Observable.__init__(self)
         self.startOnDemand = startOnDemand
@@ -85,9 +85,8 @@ class CardMonitor(Observable):
         if self.startOnDemand:
             self.rmthread = None
         else:
-            self.rmthread = CardMonitoringThread(self, self.period, self.timeout)
+            self.rmthread = CardMonitoringThread(self, self.period)
             self.rmthread.start()
-        self.timeout = timeout
 
     def addObserver(self, observer):
         """Add an observer."""
@@ -98,7 +97,7 @@ class CardMonitor(Observable):
         if self.startOnDemand:
             if 0 < self.countObservers():
                 if not self.rmthread:
-                    self.rmthread = CardMonitoringThread(self, self.period, self.timeout)
+                    self.rmthread = CardMonitoringThread(self, self.period)
 
                     # start card monitoring thread in another thread to
                     # avoid a deadlock; addObserver and notifyObservers called
@@ -140,7 +139,7 @@ class CardMonitoringThread(Thread):
 
     __shared_state = {}
 
-    def __init__(self, observable, period, timeout):
+    def __init__(self, observable, period):
         self.__dict__ = self.__shared_state
         Thread.__init__(self)
         self.observable = observable
@@ -150,14 +149,14 @@ class CardMonitoringThread(Thread):
         self.setDaemon(True)
         self.setName('smartcard.CardMonitoringThread')
         self.period = period
-        self.timeout = timeout
         self.cardrequest = None
 
     def run(self):
         """Runs until stopEvent is notified, and notify
         observers of all card insertion/removal.
         """
-        self.cardrequest = CardRequest(self.timeout)
+        self.cardrequest = CardRequest(timeout=self.period)
+        self.cardrequest.pollinginterval = self.period
         while not self.stopEvent.isSet():
             try:
                 # no need to monitor if no observers
