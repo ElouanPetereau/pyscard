@@ -155,8 +155,8 @@ class CardMonitoringThread(Thread):
         """Runs until stopEvent is notified, and notify
         observers of all card insertion/removal.
         """
-        self.cardrequest = CardRequest(timeout=self.period)
-        self.cardrequest.pollinginterval = self.period
+        self.cardrequest = CardRequest(timeout=0.1)
+        self.cardrequest.pcsccardrequest.pollinginterval = self.period
         while not self.stopEvent.isSet():
             try:
                 # no need to monitor if no observers
@@ -178,9 +178,6 @@ class CardMonitoringThread(Thread):
                         self.observable.setChanged()
                         self.observable.notifyObservers(
                             (addedcards, removedcards))
-
-                # wait every second on stopEvent
-                self.stopEvent.wait(self.period)
 
             # when CardMonitoringThread.__del__() is invoked in
             # response to shutdown, e.g., when execution of the
